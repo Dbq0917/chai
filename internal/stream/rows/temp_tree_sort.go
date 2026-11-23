@@ -145,9 +145,15 @@ func (it *TempTreeSortIterator) Next() bool {
 	// create a temporary tree
 	db := it.env.GetDB()
 	tns := it.env.GetTx().Catalog.GetFreeTransientNamespace()
-	it.temp, it.cleanup, it.err = tree.NewTransient(db.Engine.NewTransientSession(), tns, 0)
+	sess := db.Engine.NewTransientSession()
+	var truncate func() error
+	it.temp, truncate, it.err = tree.NewTransient(sess, tns, 0)
 	if it.err != nil {
+		_ = sess.Close()
 		return false
+	}
+	it.cleanup = func() error {
+		return errors.Join(truncate(), sess.Close())
 	}
 
 	// iterate over the steam and add it to the temp tree

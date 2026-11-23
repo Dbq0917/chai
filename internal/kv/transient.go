@@ -34,6 +34,10 @@ func (s *TransientSession) Close() error {
 	}
 	s.closed = true
 
+	if s.batch == nil {
+		return nil
+	}
+
 	return s.batch.Close()
 }
 
@@ -73,6 +77,8 @@ func (s *TransientSession) Get(k []byte) ([]byte, error) {
 		return nil, errors.WithStack(engine.ErrKeyNotFound)
 	}
 
+	// indexed batches read through to the store, so keys already committed
+	// by previous batch flushes are visible too.
 	return get(s.batch, k)
 }
 
@@ -104,15 +110,29 @@ func (s *TransientSession) Delete(k []byte) error {
 		return err
 	}
 
-	return s.batch.Delete(k, nil)
+	// delete the key from the uncommitted batch, where it may still be buffered
+	err = s.batch.Delete(k, nil)
+	if err != nil {
+		return err
+	}
+
+	// delete the key from the store, where it may have been committed
+	// by a previous batch flush. Tombstones added to the batch are discarded
+	// when the session is closed, so this must be done on the store directly.
+	return s.db.Delete(k, pebble.NoSync)
 }
 
 func (s *TransientSession) DeleteRange(start []byte, end []byte) error {
-	if s.batch == nil {
-		return nil
+	// delete the keys still buffered in the uncommitted batch
+	if s.batch != nil {
+		err := s.batch.DeleteRange(start, end, nil)
+		if err != nil {
+			return err
+		}
 	}
 
-	return s.batch.DeleteRange(start, end, nil)
+	// delete the keys already committed to the store by previous batch flushes
+	return s.db.DeleteRange(start, end, pebble.NoSync)
 }
 
 func (s *TransientSession) Iterator(opts *engine.IterOptions) (engine.Iterator, error) {

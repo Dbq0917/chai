@@ -144,9 +144,11 @@ func NewStore(db *pebble.DB, opts Options) *PebbleEngine {
 	}
 
 	return &PebbleEngine{
-		db:              db,
-		opts:            opts,
-		rollbackSegment: NewRollbackSegment(db, opts.RollbackSegmentNamespace),
+		db:                    db,
+		opts:                  opts,
+		rollbackSegment:       NewRollbackSegment(db, opts.RollbackSegmentNamespace),
+		minTransientNamespace: opts.MinTransientNamespace,
+		maxTransientNamespace: opts.MaxTransientNamespace,
 	}
 }
 
