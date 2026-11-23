@@ -68,26 +68,55 @@ func New(session engine.Session, ns Namespace, order SortOrder) *Tree {
 	}
 }
 
-func NewTransient(session engine.Session, ns Namespace, order SortOrder) (*Tree, func() error, error) {
+// NewTransient creates a tree backed by a transient session and returns a
+// cleanup function that reclaims its namespace once the tree is no longer
+// needed.
+//
+// The engine is used to register the namespace for the whole lifetime of the
+// tree. Reclamation only happens when the returned cleanup function runs, so
+// a transient tree used by a long-running transaction is safe: its data is
+// never deleted underneath an in-flight query, and the key range is released
+// deterministically when the caller closes the stream instead of lingering
+// until the database restarts.
+func NewTransient(eng engine.Engine, session engine.Session, ns Namespace, order SortOrder) (*Tree, func() error, error) {
 	t := Tree{
 		Namespace: ns,
 		Session:   session,
 		Order:     order,
 	}
 
+	eng.RegisterTransientNamespace(uint64(ns))
+	released := false
+	cleanup := func() error {
+		if released {
+			return nil
+		}
+
+		// the engine owns the key range reclamation: it deletes the whole
+		// namespace deterministically, including data that was flushed out of
+		// the transient batch.
+		if err := eng.ReleaseTransientNamespace(uint64(ns)); err != nil {
+			return err
+		}
+		released = true
+		return nil
+	}
+
 	// ensure the namespace is not in use
 	it, err := t.Iterator(nil)
 	if err != nil {
+		_ = eng.ReleaseTransientNamespace(uint64(ns))
 		return nil, nil, err
 	}
 	defer it.Close()
 
 	it.First()
 	if it.Valid() {
+		_ = eng.ReleaseTransientNamespace(uint64(ns))
 		return nil, nil, errors.Errorf("namespace %d is already in use", ns)
 	}
 
-	return &t, t.Truncate, nil
+	return &t, cleanup, nil
 }
 
 var defaultValue = []byte{0}

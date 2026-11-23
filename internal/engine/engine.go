@@ -19,6 +19,20 @@ type Engine interface {
 	NewSnapshotSession() Session
 	NewBatchSession() Session
 	NewTransientSession() Session
+	// RegisterTransientNamespace marks the given namespace as in use by a
+	// transient tree. The engine guarantees that the key range of a registered
+	// namespace is never reclaimed while it is still in use, even if the
+	// transient session that owns it is abandoned.
+	RegisterTransientNamespace(namespace uint64)
+	// ReleaseTransientNamespace unregisters the given namespace and
+	// deterministically reclaims its key range from the engine.
+	// It is safe to call it once the transient tree and every iterator reading
+	// from it have been closed.
+	ReleaseTransientNamespace(namespace uint64) error
+	// CleanupUnregisteredTransientNamespaces reclaims the key ranges of every
+	// transient namespace that is not currently in use. Namespaces still held
+	// by a live transient tree are preserved.
+	CleanupUnregisteredTransientNamespaces() error
 }
 
 type Session interface {

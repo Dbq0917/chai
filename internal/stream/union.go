@@ -91,7 +91,7 @@ func (it *UnionIterator) Next() bool {
 	// create a temporary tree
 	db := it.env.GetDB()
 	tns := it.env.GetTx().Catalog.GetFreeTransientNamespace()
-	it.temp, it.cleanup, it.err = tree.NewTransient(db.Engine.NewTransientSession(), tns, 0)
+	it.temp, it.cleanup, it.err = tree.NewTransient(db.Engine, db.Engine.NewTransientSession(), tns, 0)
 	if it.err != nil {
 		return false
 	}

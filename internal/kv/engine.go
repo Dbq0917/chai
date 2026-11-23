@@ -5,6 +5,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 
@@ -38,6 +39,15 @@ type PebbleEngine struct {
 
 	minTransientNamespace uint64
 	maxTransientNamespace uint64
+
+	// transientLifecycle tracks the transient namespaces that are currently
+	// in use. It prevents a namespace from being reclaimed while a transient
+	// tree (or an iterator reading from it) is still alive, and makes cleanup
+	// deterministic once the tree is released.
+	transientLifecycle struct {
+		sync.Mutex
+		inUse map[uint64]struct{}
+	}
 }
 
 type Options struct {
@@ -143,11 +153,13 @@ func NewStore(db *pebble.DB, opts Options) *PebbleEngine {
 		panic("max transient namespace cannot be 0")
 	}
 
-	return &PebbleEngine{
+	engine := &PebbleEngine{
 		db:              db,
 		opts:            opts,
 		rollbackSegment: NewRollbackSegment(db, opts.RollbackSegmentNamespace),
 	}
+	engine.transientLifecycle.inUse = make(map[uint64]struct{})
+	return engine
 }
 
 func (s *PebbleEngine) Close() error {
@@ -189,4 +201,86 @@ func (s *PebbleEngine) CleanupTransientNamespaces() error {
 		encoding.EncodeUint(nil, uint64(s.maxTransientNamespace)),
 		pebble.NoSync,
 	)
+}
+
+// RegisterTransientNamespace marks a transient namespace as in use.
+// A registered namespace is excluded from any range cleanup until it is
+// released, so data still being read by a long-running transaction cannot
+// be reclaimed underneath it.
+func (s *PebbleEngine) RegisterTransientNamespace(namespace uint64) {
+	s.transientLifecycle.Lock()
+	s.transientLifecycle.inUse[namespace] = struct{}{}
+	s.transientLifecycle.Unlock()
+}
+
+// IsTransientNamespaceInUse reports whether a transient namespace is
+// currently registered, i.e. whether a transient tree is still alive.
+func (s *PebbleEngine) IsTransientNamespaceInUse(namespace uint64) bool {
+	s.transientLifecycle.Lock()
+	_, ok := s.transientLifecycle.inUse[namespace]
+	s.transientLifecycle.Unlock()
+	return ok
+}
+
+// ReleaseTransientNamespace unregisters a transient namespace and reclaims
+// the whole key range it occupies. The delete is applied directly to the
+// engine (outside of any user transaction), so the memory is returned as
+// soon as the transient tree is closed instead of surviving until the
+// database restarts.
+func (s *PebbleEngine) ReleaseTransientNamespace(namespace uint64) error {
+	s.transientLifecycle.Lock()
+	_, ok := s.transientLifecycle.inUse[namespace]
+	if ok {
+		delete(s.transientLifecycle.inUse, namespace)
+	}
+	s.transientLifecycle.Unlock()
+
+	if !ok {
+		return nil
+	}
+
+	return s.db.DeleteRange(
+		encoding.EncodeUint(nil, namespace),
+		encoding.EncodeUint(nil, namespace+1),
+		pebble.NoSync,
+	)
+}
+
+// CleanupUnregisteredTransientNamespaces reclaims every transient namespace
+// that is not currently in use. In-use namespaces are skipped by deleting
+// around them, which keeps long-running transient trees intact.
+// It is used on startup to remove data left over by a previous process that
+// did not get a chance to release its transient trees.
+func (s *PebbleEngine) CleanupUnregisteredTransientNamespaces() error {
+	s.transientLifecycle.Lock()
+	inUse := make([]uint64, 0, len(s.transientLifecycle.inUse))
+	for ns := range s.transientLifecycle.inUse {
+		inUse = append(inUse, ns)
+	}
+	s.transientLifecycle.Unlock()
+	sort.Slice(inUse, func(i, j int) bool { return inUse[i] < inUse[j] })
+
+	start := s.minTransientNamespace
+	for _, ns := range inUse {
+		if ns > start {
+			if err := s.db.DeleteRange(
+				encoding.EncodeUint(nil, start),
+				encoding.EncodeUint(nil, ns),
+				pebble.NoSync,
+			); err != nil {
+				return err
+			}
+		}
+		start = ns + 1
+	}
+
+	if start < s.maxTransientNamespace {
+		return s.db.DeleteRange(
+			encoding.EncodeUint(nil, start),
+			encoding.EncodeUint(nil, s.maxTransientNamespace),
+			pebble.NoSync,
+		)
+	}
+
+	return nil
 }

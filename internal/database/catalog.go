@@ -50,6 +50,8 @@ type Catalog struct {
 	CatalogTable *CatalogStore
 
 	TransientNamespaces *atomic.Counter
+
+	transientLifecycle TransientNamespaceLifecycle
 }
 
 func NewCatalog() *Catalog {
@@ -65,6 +67,7 @@ func (c *Catalog) Clone() *Catalog {
 		Cache:               c.Cache.Clone(),
 		CatalogTable:        c.CatalogTable,
 		TransientNamespaces: c.TransientNamespaces,
+		transientLifecycle:  c.transientLifecycle,
 	}
 }
 
@@ -148,12 +151,41 @@ func (c *Catalog) ListSequences() []string {
 // GetFreeTransientNamespace returns the next available transient namespace.
 // Transient namespaces start from math.MaxInt64 - (2 << 24) to math.MaxInt64 (around 16 M).
 // The transient namespaces counter is not persisted and resets when the database is restarted.
-// Once the counter reaches its maximum value, it will wrap around to the minimum value.
-// Technically, if a transient namespace is still in use by the time the counter wraps around
-// its data may be overwritten. However, transient trees are supposed to verify that the
-// namespace is not in use before writing to it.
+// Once the counter reaches its maximum value, it wraps around to the minimum value.
+//
+// When the engine reports transient namespaces that are still in use, the
+// counter skips them instead of handing out a namespace whose data is being
+// read by a long-running transaction. This makes wrap-around safe even when a
+// batch job keeps transient trees alive for hours.
 func (c *Catalog) GetFreeTransientNamespace() tree.Namespace {
-	return tree.Namespace(c.TransientNamespaces.Incr())
+	if c.transientLifecycle == nil {
+		return tree.Namespace(c.TransientNamespaces.Incr())
+	}
+
+	// every namespace is in use at most once, so scanning the whole range
+	// guarantees finding a free one unless the entire range is occupied.
+	maxAttempts := int64(MaxTransientNamespace - MinTransientNamespace)
+	for range maxAttempts {
+		ns := tree.Namespace(c.TransientNamespaces.Incr())
+		if !c.transientLifecycle.IsTransientNamespaceInUse(uint64(ns)) {
+			return ns
+		}
+	}
+
+	panic("no free transient namespace available")
+}
+
+// SetTransientNamespaceLifecycle binds the engine component responsible for
+// tracking transient namespace lifetimes. It allows the catalog to avoid
+// reassigning a namespace that is still in use when its counter wraps around.
+func (c *Catalog) SetTransientNamespaceLifecycle(lifecycle TransientNamespaceLifecycle) {
+	c.transientLifecycle = lifecycle
+}
+
+// TransientNamespaceLifecycle is implemented by the storage engine and reports
+// whether a transient namespace is currently in use.
+type TransientNamespaceLifecycle interface {
+	IsTransientNamespaceInUse(namespace uint64) bool
 }
 
 // A CatalogWriter is used to apply modifications to the catalog

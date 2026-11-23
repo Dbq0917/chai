@@ -34,7 +34,28 @@ func (s *TransientSession) Close() error {
 	}
 	s.closed = true
 
+	if s.batch == nil {
+		return nil
+	}
+
 	return s.batch.Close()
+}
+
+// Flush commits the pending batch to the engine and resets it, so the
+// accumulated keys become visible to other sessions and the memory held by
+// the batch can be reclaimed. Flushed keys remain protected by the transient
+// namespace lifecycle until the owning tree is released.
+func (s *TransientSession) Flush() error {
+	if s.batch == nil || s.batch.Count() == 0 {
+		return nil
+	}
+
+	if err := s.batch.Commit(pebble.NoSync); err != nil {
+		return err
+	}
+
+	s.batch.Reset()
+	return nil
 }
 
 func (s *TransientSession) Insert(k, v []byte) error {

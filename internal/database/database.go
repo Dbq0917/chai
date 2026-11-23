@@ -44,6 +44,10 @@ type Database struct {
 
 	// Underlying kv store.
 	Engine engine.Engine
+
+	// tracks transient namespaces that are still in use, so the catalog can
+	// avoid handing them out again when its transient counter wraps around.
+	transientNamespaceLifecycle TransientNamespaceLifecycle
 }
 
 // Options are passed to Open to control
@@ -79,6 +83,10 @@ func Open(path string, opts *Options) (*Database, error) {
 		Engine: store,
 	}
 
+	// the engine tracks transient namespace lifetimes so the catalog can skip
+	// namespaces that are still in use when its transient counter wraps around.
+	db.transientNamespaceLifecycle = store
+
 	// create a context that will be cancelled when the database is closed.
 	db.closeContext, db.closeCancel = context.WithCancel(context.Background())
 
@@ -89,7 +97,8 @@ func Open(path string, opts *Options) (*Database, error) {
 		return nil, err
 	}
 
-	// clean up the transient namespaces
+	// clean up transient namespaces left over by a previous run. At this point
+	// no transient tree can exist yet, so the whole range can be reclaimed.
 	err = db.Engine.CleanupTransientNamespaces()
 	if err != nil {
 		return nil, err
@@ -102,6 +111,7 @@ func Open(path string, opts *Options) (*Database, error) {
 	defer tx.Rollback()
 
 	db.catalog = NewCatalog()
+	db.catalog.SetTransientNamespaceLifecycle(db.transientNamespaceLifecycle)
 	tx.Catalog = db.catalog
 
 	if opts.CatalogLoader != nil {
