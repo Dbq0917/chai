@@ -1,6 +1,7 @@
 package chai_test
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"os"
@@ -277,6 +278,127 @@ func TestRWConcurrency(t *testing.T) {
 	}
 
 	wg.Wait()
+}
+
+func TestRWConcurrencySnapshotIsolation(t *testing.T) {
+	db, err := sql.Open("chai", ":memory:")
+	require.NoError(t, err)
+	defer db.Close()
+
+	_, err = db.Exec(`
+		CREATE TABLE accounts (
+			id INTEGER PRIMARY KEY,
+			balance INTEGER NOT NULL
+		);
+		INSERT INTO accounts (id, balance) VALUES (1, 100), (2, 100);
+	`)
+	require.NoError(t, err)
+
+	writer, err := db.Begin()
+	require.NoError(t, err)
+
+	_, err = writer.Exec("UPDATE accounts SET balance = balance - 25 WHERE id = 1")
+	require.NoError(t, err)
+
+	// A second writable transaction must be able to read while the first
+	// one has uncommitted changes. Its reads come from a snapshot and must
+	// not block on the writer.
+	reader, err := db.Begin()
+	require.NoError(t, err)
+	defer reader.Rollback()
+
+	var balance int
+	require.NoError(t, reader.QueryRow("SELECT balance FROM accounts WHERE id = 1").Scan(&balance))
+	require.Equal(t, 100, balance)
+	require.NoError(t, reader.QueryRow("SELECT balance FROM accounts WHERE id = 2").Scan(&balance))
+	require.Equal(t, 100, balance)
+
+	_, err = writer.Exec("UPDATE accounts SET balance = balance + 25 WHERE id = 2")
+	require.NoError(t, err)
+	require.NoError(t, writer.Commit())
+
+	// The reader keeps the snapshot it started with, even after the writer
+	// commits.
+	require.NoError(t, reader.QueryRow("SELECT balance FROM accounts WHERE id = 1").Scan(&balance))
+	require.Equal(t, 100, balance)
+	require.NoError(t, reader.QueryRow("SELECT balance FROM accounts WHERE id = 2").Scan(&balance))
+	require.Equal(t, 100, balance)
+
+	// A new transaction sees the committed values.
+	require.NoError(t, reader.Rollback())
+	require.NoError(t, db.QueryRow("SELECT balance FROM accounts WHERE id = 1").Scan(&balance))
+	require.Equal(t, 75, balance)
+	require.NoError(t, db.QueryRow("SELECT balance FROM accounts WHERE id = 2").Scan(&balance))
+	require.Equal(t, 125, balance)
+}
+
+func TestRWConcurrencyRollbackIsolation(t *testing.T) {
+	db, err := sql.Open("chai", ":memory:")
+	require.NoError(t, err)
+	defer db.Close()
+
+	_, err = db.Exec(`
+		CREATE TABLE accounts (
+			id INTEGER PRIMARY KEY,
+			balance INTEGER NOT NULL
+		);
+		INSERT INTO accounts (id, balance) VALUES (1, 100);
+	`)
+	require.NoError(t, err)
+
+	writer, err := db.Begin()
+	require.NoError(t, err)
+	_, err = writer.Exec("UPDATE accounts SET balance = 200 WHERE id = 1")
+	require.NoError(t, err)
+
+	reader, err := db.Begin()
+	require.NoError(t, err)
+	defer reader.Rollback()
+
+	var balance int
+	require.NoError(t, reader.QueryRow("SELECT balance FROM accounts WHERE id = 1").Scan(&balance))
+	require.Equal(t, 100, balance)
+
+	require.NoError(t, writer.Rollback())
+
+	require.NoError(t, reader.QueryRow("SELECT balance FROM accounts WHERE id = 1").Scan(&balance))
+	require.Equal(t, 100, balance)
+	require.NoError(t, db.QueryRow("SELECT balance FROM accounts WHERE id = 1").Scan(&balance))
+	require.Equal(t, 100, balance)
+}
+
+func TestIsolationLevels(t *testing.T) {
+	db, err := sql.Open("chai", ":memory:")
+	require.NoError(t, err)
+	defer db.Close()
+
+	_, err = db.Exec("CREATE TABLE test (a INTEGER PRIMARY KEY); INSERT INTO test (a) VALUES (1);")
+	require.NoError(t, err)
+
+	for _, level := range []sql.IsolationLevel{
+		sql.LevelDefault,
+		sql.LevelReadUncommitted,
+		sql.LevelReadCommitted,
+		sql.LevelRepeatableRead,
+		sql.LevelSnapshot,
+		sql.LevelSerializable,
+	} {
+		t.Run(level.String(), func(t *testing.T) {
+			tx, err := db.BeginTx(context.Background(), &sql.TxOptions{
+				Isolation: level,
+				ReadOnly:  true,
+			})
+			require.NoError(t, err)
+			defer tx.Rollback()
+
+			var a int
+			require.NoError(t, tx.QueryRow("SELECT a FROM test").Scan(&a))
+			require.Equal(t, 1, a)
+		})
+	}
+
+	_, err = db.BeginTx(context.Background(), &sql.TxOptions{Isolation: sql.LevelLinearizable})
+	require.ErrorContains(t, err, "isolation level")
 }
 
 func TestOrderByConcurrency(t *testing.T) {

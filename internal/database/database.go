@@ -59,10 +59,43 @@ type CatalogLoader interface {
 	LoadCatalog(engine.Session) (*Catalog, error)
 }
 
+// IsolationLevel controls the visibility of concurrent writes to a
+// transaction.
+type IsolationLevel int
+
+const (
+	LevelDefault IsolationLevel = iota
+	LevelReadUncommitted
+	LevelReadCommitted
+	LevelWriteCommitted
+	LevelRepeatableRead
+	LevelSnapshot
+	LevelSerializable
+	LevelLinearizable
+)
+
+func (l IsolationLevel) supported() bool {
+	switch l {
+	case LevelDefault,
+		LevelReadUncommitted,
+		LevelReadCommitted,
+		LevelRepeatableRead,
+		LevelSnapshot,
+		LevelSerializable:
+		return true
+	default:
+		return false
+	}
+}
+
 // TxOptions are passed to Begin to configure transactions.
 type TxOptions struct {
 	// Open a read-only transaction.
 	ReadOnly bool
+	// Isolation is the isolation level requested for the transaction.
+	// ChaiSQL provides snapshot isolation. The value is kept for
+	// compatibility with database/sql drivers.
+	Isolation IsolationLevel
 }
 
 func Open(path string, opts *Options) (*Database, error) {
@@ -100,6 +133,10 @@ func Open(path string, opts *Options) (*Database, error) {
 		return nil, err
 	}
 	defer tx.Rollback()
+
+	if err := tx.BeginWrite(); err != nil {
+		return nil, err
+	}
 
 	db.catalog = NewCatalog()
 	tx.Catalog = db.catalog
@@ -145,6 +182,10 @@ func (db *Database) closeDatabase() error {
 		return err
 	}
 	defer tx.Session.Close()
+
+	if err := tx.BeginWrite(); err != nil {
+		return err
+	}
 
 	for _, seqName := range tx.Catalog.ListSequences() {
 		seq, err := tx.Catalog.GetSequence(seqName)
@@ -205,8 +246,8 @@ func (db *Database) beginTx(opts *TxOptions) (*Transaction, error) {
 		opts = new(TxOptions)
 	}
 
-	if !opts.ReadOnly {
-		db.writetxmu.Lock()
+	if !opts.Isolation.supported() {
+		return nil, errors.Errorf("isolation level %d is not supported", opts.Isolation)
 	}
 
 	db.txmu.RLock()
@@ -221,21 +262,19 @@ func (db *Database) beginTxUnlocked(opts *TxOptions) (*Transaction, error) {
 		opts = &TxOptions{}
 	}
 
-	var sess engine.Session
-	if opts.ReadOnly {
-		sess = db.Engine.NewSnapshotSession()
-	} else {
-		sess = db.Engine.NewBatchSession()
-	}
+	// Every transaction starts from a snapshot. Writable transactions
+	// upgrade to a batch session once they perform their first write.
+	sess := db.Engine.NewSnapshotSession()
 
 	tx := Transaction{
-		db:       db,
-		Engine:   db.Engine,
-		Session:  sess,
-		Writable: !opts.ReadOnly,
-		ID:       db.transactionIDs.Add(1),
-		Catalog:  db.Catalog(),
-		TxStart:  time.Now(),
+		db:        db,
+		Engine:    db.Engine,
+		Session:   sess,
+		Writable:  !opts.ReadOnly,
+		ID:        db.transactionIDs.Add(1),
+		Catalog:   db.Catalog(),
+		TxStart:   time.Now(),
+		isolation: opts.Isolation,
 	}
 
 	if !opts.ReadOnly {

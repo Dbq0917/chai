@@ -77,6 +77,19 @@ func (q *Query) Run(c *Context) (*statement.Result, error) {
 			}
 		}
 
+		// Writable transactions read from a snapshot until their first
+		// write, so upgrade them before preparing or running a statement
+		// that may modify the database.
+		if needsTx && !isReadOnly && c.Conn.GetTx() != nil {
+			if err := c.Conn.GetTx().BeginWrite(); err != nil {
+				if tx != nil {
+					_ = tx.Rollback()
+				}
+
+				return nil, err
+			}
+		}
+
 		// prepare
 		stmt, err = Prepare(&sctx, stmt)
 		if err != nil {
@@ -187,4 +200,20 @@ func Prepare(ctx *statement.Context, stmt statement.Statement) (statement.Statem
 
 type PreparedStatement struct {
 	statement.Statement
+}
+
+func (s PreparedStatement) IsReadOnly() bool {
+	if ro, ok := s.Statement.(statement.ReadOnly); ok {
+		return ro.IsReadOnly()
+	}
+
+	return false
+}
+
+func (s PreparedStatement) NeedsTransaction() bool {
+	if tx, ok := s.Statement.(statement.Transactional); ok {
+		return tx.NeedsTransaction()
+	}
+
+	return true
 }

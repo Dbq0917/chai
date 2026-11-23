@@ -202,16 +202,26 @@ func (c *Conn) ResetSession(ctx context.Context) error {
 
 // BeginTx starts and returns a new transaction.
 // It uses the ReadOnly option to determine whether to start a read-only or read/write transaction.
-// If the Isolation option is non zero, an error is returned.
+// ChaiSQL provides snapshot isolation for all supported levels.
 func (c *Conn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, error) {
-	if opts.Isolation != 0 {
-		return nil, errors.New("isolation levels are not supported")
+	switch database.IsolationLevel(opts.Isolation) {
+	case database.LevelDefault,
+		database.LevelReadUncommitted,
+		database.LevelReadCommitted,
+		database.LevelRepeatableRead,
+		database.LevelSnapshot,
+		database.LevelSerializable:
+	case database.LevelWriteCommitted, database.LevelLinearizable:
+		return nil, errors.Errorf("isolation level %d is not supported", opts.Isolation)
+	default:
+		return nil, errors.Errorf("unknown isolation level %d", opts.Isolation)
 	}
 
 	// if the ReadOnly flag is explicitly specified, create a read-only transaction,
 	// otherwise create a read/write transaction.
 	tx, err := c.conn.BeginTx(&database.TxOptions{
-		ReadOnly: opts.ReadOnly,
+		ReadOnly:  opts.ReadOnly,
+		Isolation: database.IsolationLevel(opts.Isolation),
 	})
 	if err != nil {
 		return nil, err

@@ -16,15 +16,18 @@ type BatchSession struct {
 	Store           *PebbleEngine
 	DB              *pebble.DB
 	Batch           *pebble.Batch
+	snapshot        *snapshot
+	written         bool
 	closed          bool
 	rollbackSegment *RollbackSegment
 	maxBatchSize    int
 }
 
 func (s *PebbleEngine) NewBatchSession() engine.Session {
-	// before creating a batch session, create a shared snapshot
-	// at this point-in-time.
-	s.LockSharedSnapshot()
+	// Take a snapshot before creating the batch. Reads performed before the
+	// first write use this snapshot, so they cannot observe intermediate
+	// commits made by another write session.
+	sn := s.acquireSharedSnapshot()
 
 	b := s.db.NewIndexedBatch()
 
@@ -32,6 +35,7 @@ func (s *PebbleEngine) NewBatchSession() engine.Session {
 		Store:           s,
 		DB:              s.db,
 		Batch:           b,
+		snapshot:        sn,
 		rollbackSegment: s.rollbackSegment,
 		maxBatchSize:    s.opts.MaxBatchSize,
 	}
@@ -63,18 +67,29 @@ func (s *BatchSession) Close() error {
 	}
 	s.closed = true
 
-	s.Store.UnlockSharedSnapshot()
+	err := s.Batch.Close()
+	if snapshotErr := s.Store.releaseSharedSnapshot(s.snapshot); err == nil {
+		err = snapshotErr
+	}
 
-	return s.Batch.Close()
+	return err
 }
 
 // Get returns a value associated with the given key. If not found, returns ErrKeyNotFound.
 func (s *BatchSession) Get(k []byte) ([]byte, error) {
+	if !s.written {
+		return get(s.snapshot.snapshot, k)
+	}
+
 	return get(s.Batch, k)
 }
 
 // Exists returns whether a key exists and is visible by the current session.
 func (s *BatchSession) Exists(k []byte) (bool, error) {
+	if !s.written {
+		return exists(s.snapshot.snapshot, k)
+	}
+
 	return exists(s.Batch, k)
 }
 
@@ -133,6 +148,8 @@ func (s *BatchSession) Insert(k, v []byte) error {
 		return err
 	}
 
+	s.written = true
+
 	return s.ensureBatchSize()
 }
 
@@ -151,6 +168,8 @@ func (s *BatchSession) Put(k, v []byte) error {
 		return err
 	}
 
+	s.written = true
+
 	return s.ensureBatchSize()
 }
 
@@ -160,6 +179,8 @@ func (s *BatchSession) Delete(k []byte) error {
 	if err != nil {
 		return err
 	}
+
+	s.written = true
 
 	return s.ensureBatchSize()
 }
@@ -171,6 +192,8 @@ func (s *BatchSession) DeleteRange(start []byte, end []byte) error {
 	if err != nil {
 		return err
 	}
+
+	s.written = true
 
 	return s.ensureBatchSize()
 }
@@ -184,7 +207,13 @@ func (s *BatchSession) Iterator(opts *engine.IterOptions) (engine.Iterator, erro
 		}
 	}
 
-	it, err := s.Batch.NewIter(popts)
+	var it *pebble.Iterator
+	var err error
+	if s.written {
+		it, err = s.Batch.NewIter(popts)
+	} else {
+		it, err = s.snapshot.snapshot.NewIter(popts)
+	}
 	if err != nil {
 		return nil, err
 	}

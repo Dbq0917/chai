@@ -34,6 +34,9 @@ type PebbleEngine struct {
 		sync.RWMutex
 
 		snapshot *snapshot
+		// writers is the number of batch sessions currently using snapshot.
+		// The snapshot is kept until the last writer is closed.
+		writers int
 	}
 
 	minTransientNamespace uint64
@@ -162,21 +165,48 @@ func (s *PebbleEngine) Recover() error {
 	return s.rollbackSegment.Reset()
 }
 
-func (s *PebbleEngine) LockSharedSnapshot() {
+func (s *PebbleEngine) acquireSharedSnapshot() *snapshot {
 	s.sharedSnapshot.Lock()
-	s.sharedSnapshot.snapshot = &snapshot{
-		snapshot: s.db.NewSnapshot(),
-		refCount: atomic.NewCounter(0, math.MaxInt64, false),
+	defer s.sharedSnapshot.Unlock()
+
+	if s.sharedSnapshot.snapshot == nil {
+		s.sharedSnapshot.snapshot = &snapshot{
+			snapshot: s.db.NewSnapshot(),
+			refCount: atomic.NewCounter(0, math.MaxInt64, false),
+		}
 	}
+
 	s.sharedSnapshot.snapshot.Incr()
+	s.sharedSnapshot.writers++
+
+	return s.sharedSnapshot.snapshot
+}
+
+func (s *PebbleEngine) releaseSharedSnapshot(sn *snapshot) error {
+	s.sharedSnapshot.Lock()
+	s.sharedSnapshot.writers--
+	if s.sharedSnapshot.writers == 0 && s.sharedSnapshot.snapshot == sn {
+		s.sharedSnapshot.snapshot = nil
+	}
 	s.sharedSnapshot.Unlock()
+
+	return sn.Done()
+}
+
+func (s *PebbleEngine) LockSharedSnapshot() {
+	s.acquireSharedSnapshot()
 }
 
 func (s *PebbleEngine) UnlockSharedSnapshot() {
 	s.sharedSnapshot.Lock()
-	s.sharedSnapshot.snapshot.Done()
+	sn := s.sharedSnapshot.snapshot
 	s.sharedSnapshot.snapshot = nil
+	s.sharedSnapshot.writers = 0
 	s.sharedSnapshot.Unlock()
+
+	if sn != nil {
+		_ = sn.Done()
+	}
 }
 
 func (s *PebbleEngine) DB() *pebble.DB {
