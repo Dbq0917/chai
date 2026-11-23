@@ -154,22 +154,9 @@ func (i *indexSelector) selectIndex() error {
 		}
 	}
 
-	// select the cheapest plan
+	// select the best index candidate
 	var selected *candidate
 	var cost int
-
-	// start with the primary key of the table
-	tb, err := i.sctx.Catalog.GetTableInfo(i.tableScan.TableName)
-	if err != nil {
-		return err
-	}
-	pk := tb.PrimaryKey
-	if pk != nil {
-		selected = i.associateIndexWithNodes(tb.TableName, false, false, pk.Columns, pk.SortOrder, nodes)
-		if selected != nil {
-			cost = selected.Cost()
-		}
-	}
 
 	// get all the indexes for this table and associate them
 	// with compatible candidates
@@ -196,6 +183,24 @@ func (i *indexSelector) selectIndex() error {
 		if len(selected.nodes) < len(candidate.nodes) || (len(selected.nodes) == len(candidate.nodes) && c < cost) {
 			cost = c
 			selected = candidate
+		}
+	}
+
+	// evaluate the primary key of the table and compare it with the
+	// selected index candidate, if any.
+	// Because scanning the primary key means reading the full rows,
+	// it is only selected if the query conditions make it at least
+	// as selective as the index candidate, instead of being
+	// systematically preferred.
+	tb, err := i.sctx.Catalog.GetTableInfo(i.tableScan.TableName)
+	if err != nil {
+		return err
+	}
+	pk := tb.PrimaryKey
+	if pk != nil {
+		pkCandidate := i.associateIndexWithNodes(tb.TableName, false, false, pk.Columns, pk.SortOrder, nodes)
+		if pkCandidate != nil && (selected == nil || pkCandidate.isPreferableTo(selected)) {
+			selected = pkCandidate
 		}
 	}
 
@@ -649,6 +654,24 @@ func (c *candidate) Cost() int {
 	cost -= len(c.nodes)
 
 	return cost
+}
+
+// isPreferableTo reports whether c should be preferred over other.
+// The selectivity of the ranges, which is derived from the query
+// conditions, drives the choice: a candidate scanning fewer rows
+// wins even if it consumes fewer filter nodes.
+// The number of consumed filter nodes and the cost are used
+// as tie breakers.
+func (c *candidate) isPreferableTo(other *candidate) bool {
+	if c.rangesCost != other.rangesCost {
+		return c.rangesCost < other.rangesCost
+	}
+
+	if len(c.nodes) != len(other.nodes) {
+		return len(c.nodes) > len(other.nodes)
+	}
+
+	return c.Cost() < other.Cost()
 }
 
 // operatorIsIndexCompatible returns whether the operator can be used to read from an index.

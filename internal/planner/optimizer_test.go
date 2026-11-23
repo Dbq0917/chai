@@ -444,6 +444,18 @@ func TestSelectIndex_Composite(t *testing.T) {
 			stream.New(index.Scan("idx_foo_a_b_c", stream.Range{Min: testutil.ExprList(t, `(1, 2)`), Exact: true})).
 				Pipe(rows.Filter(parser.MustParseExpr("k = 3"))),
 		},
+		{
+			// the exact match on the primary key is more selective than
+			// the range on the first two paths of idx_foo_a_b_c
+			"FROM foo WHERE a = 1 AND b > 2 AND k = 3",
+			stream.New(table.Scan("foo")).
+				Pipe(rows.Filter(parser.MustParseExpr("a = 1"))).
+				Pipe(rows.Filter(parser.MustParseExpr("b > 2"))).
+				Pipe(rows.Filter(parser.MustParseExpr("k = 3"))),
+			stream.New(table.Scan("foo", stream.Range{Min: exprList(testutil.IntegerValue(3)), Exact: true})).
+				Pipe(rows.Filter(parser.MustParseExpr("a = 1"))).
+				Pipe(rows.Filter(parser.MustParseExpr("b > 2"))),
+		},
 		// If a path is missing from the query, we can still the index, with paths after the missing one are
 		// using filter nodes rather than the index.
 		{
